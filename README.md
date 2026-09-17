@@ -61,6 +61,8 @@ ssh gpu-node-1 'bash -s' < collect-host-logs.sh > host-logs.txt
 | `--step` | 自動(≥ 15s) | 解析度。資料點上限是每個 series 11000 點,15s 可以涵蓋約 45 小時 |
 | `--title` | `<instance> slowdown <時間>` | 草稿標題 |
 | `--out` | `./incident-<instance>-<start>` | 輸出資料夾;已存在且非空時要加 `--force` |
+| `--host-logs` | | `collect-host-logs.sh` 的輸出;帶了才會檢查 kernel log 那幾項假設 |
+| `--hypotheses` | 同目錄的 json | 排查清單的定義檔 |
 | `--list` | | 只印出所有 PromQL,不連 Prometheus。可以拿去 Grafana Explore 貼上用 |
 
 ## 產出
@@ -94,6 +96,43 @@ Prometheus 只保留 15 天,**這個資料夾就是證據的正本**。
 
 某個 exporter 在這台主機上不存在(例如沒有 GPU),總覽表會寫 `no data`,不影響其他部分。
 query 執行失敗會記在 `meta.json` 和總覽表的最後一欄,其他 query 會繼續跑。
+
+## 排查清單(原因假設)
+
+報告的「根本原因」段落會附一張排查清單:每個常見原因寫清楚「若成立應該看到什麼」,
+腳本再依實際資料判定:
+
+| 結論 | 意思 |
+| --- | --- |
+| **已排除** | 那段時間有資料,而且沒有任何 series 超過門檻 |
+| **無法判斷** | 沒有資料。通常代表監控缺口,每一條都該變成一項待辦事項 |
+| **有跡象** | 資料出現符合的特徵。有跡象不等於就是原因,因果要人判斷 |
+| **需人工判斷** | 用量排行,或沒有設門檻的訊號。要人看過才能下結論 |
+
+**「已排除」只在取樣解析度內成立**:15 秒取樣一次,更短的尖峰本來就看不到。
+這句提醒也留在草稿裡,避免被過度解讀。
+
+### 加上 kernel log 的證據
+
+OOM、hung task、NFS/SMB 逾時、GPU XID 這些只存在 kernel log 裡。撈回 log 之後再跑一次,
+清單就會把 log 的證據一起算進去,命中的行也會加進時間線:
+
+```bash
+python3 incident_dump.py --start ... --end ... --instance ... \
+    --host-logs incident-<主機>-<時間>/host-logs.txt --force
+```
+
+### 自訂檢查項目
+
+清單定義在 `hypotheses.zh-tw.json`,純資料檔,不用改程式:
+
+- `signals`:走勢類 query 的 id(判斷有沒有資料、有沒有超過門檻)
+- `events`:事件類 query 的 id(有列出來就是證據,例如 OOM)
+- `tables`:用量排行,只列給人看
+- `log`:在 `host-logs.txt` 裡比對的字串(不分大小寫)
+- `needs`:沒資料時告訴讀者少了什麼
+
+query id 可以用 `--list` 查。
 
 ## 判讀:門檻、基準線與限制
 

@@ -1,0 +1,209 @@
+{
+  "_comment": [
+    "排查清單:每個假設對應一組 query,incident_dump.py 依實際資料判定結論。",
+    "signals = 走勢類 query(range),用來判斷『有沒有資料』和『有沒有超過門檻』。",
+    "events  = 事件類 query(table,通常帶 > 0 過濾),有列出來就是證據。",
+    "tables  = 用量排行,只列出來給人看,不自動下結論。",
+    "log     = 在 host-logs.txt 裡比對的字串(不分大小寫),要用 --host-logs 指定才會檢查。",
+    "kind=usage 的假設一律標成『需人工判斷』:用量高不等於就是原因。",
+    "needs   = 缺資料時告訴讀者少了什麼。改這個檔不用改程式。"
+  ],
+  "labels": {
+    "supported": "有跡象",
+    "ruled_out": "已排除",
+    "undetermined": "無法判斷",
+    "manual": "需人工判斷"
+  },
+  "phrases": {
+    "peak": "`{signal}`{series} 峰值 {peak}(基準線 p95 {base},門檻 {threshold}),{time} 起",
+    "below": "`{signal}`{series} 最高 {max},未達門檻 {threshold}",
+    "event": "`{signal}`{series} 窗內 {value}",
+    "log": "host-logs 命中「{pattern}」{count} 筆",
+    "nodata": "無資料:{signals}",
+    "nologs": "未提供 host-logs.txt,kernel log 未檢查",
+    "missing": "(另外無資料:{signals})",
+    "top": "用量最高:{rows}",
+    "log_none": "host-logs 未命中:{patterns}",
+    "no_threshold": "`{signal}`{series} 峰值 {peak}(此訊號沒有門檻,要人看圖判斷)",
+    "coverage_ok": "窗內所有 job 都有資料",
+    "tally": "共 {total} 項:{counts}",
+    "none": "沒有可用的檢查項目"
+  },
+  "hypotheses": [
+    {
+      "id": "login-path",
+      "group": "使用者體感",
+      "title": "登入或互動指令本身變慢",
+      "signature": "ssh-probe 的登入、登出、cd/ls/poetry 延遲升高,或出現失敗",
+      "signals": ["ssh_connect", "ssh_logout", "ssh_command", "ssh_connect_failures", "ssh_command_failures"],
+      "events": ["t_ssh_failures"],
+      "needs": "ssh-probe(監控端的 SSH 探針)"
+    },
+    {
+      "id": "cpu-saturation",
+      "group": "主機資源",
+      "title": "CPU 飽和,大家都在排隊",
+      "signature": "CPU busy 接近 100%、load 高於核心數、CPU PSI 升高",
+      "signals": ["host_cpu_busy", "host_load", "host_psi_cpu", "cg_psi_cpu"],
+      "needs": "node_exporter(主機層級)或 cgroup-exporter 的 CPU PSI"
+    },
+    {
+      "id": "memory-pressure",
+      "group": "主機資源",
+      "title": "記憶體壓力導致大量回收",
+      "signature": "memory PSI 升高,page cache 被回收後重讀(refault)或直接回收(direct reclaim)增加",
+      "signals": ["cg_psi_mem_some", "cg_psi_mem_full", "host_psi_mem_some", "host_psi_mem_full",
+                  "cg_refault", "cg_direct_reclaim"],
+      "needs": "cgroup-exporter 或 node_exporter"
+    },
+    {
+      "id": "oom",
+      "group": "主機資源",
+      "title": "記憶體用盡,process 被 OOM killer 殺掉",
+      "signature": "OOM kill 計數增加,kernel log 出現 Out of memory",
+      "signals": ["cg_oom_kill", "ctr_oom"],
+      "events": ["t_oom", "t_ctr_oom"],
+      "log": ["out of memory", "oom-kill", "killed process"],
+      "needs": "cgroup-exporter 或 cAdvisor"
+    },
+    {
+      "id": "swap-thrash",
+      "group": "主機資源",
+      "title": "記憶體換出到 swap,反覆換入",
+      "signature": "swap-in 速率升高(每秒換入大量 page)",
+      "signals": ["host_swap_in"],
+      "needs": "node_exporter"
+    },
+    {
+      "id": "io-saturation",
+      "group": "主機資源",
+      "title": "磁碟 IO 飽和",
+      "signature": "磁碟忙碌率接近 100%、iowait 升高、IO PSI 升高,或某個 cgroup 的讀寫量暴增",
+      "signals": ["host_disk_busy", "host_iowait", "host_psi_io_some", "host_psi_io_full",
+                  "cg_psi_io_some", "cg_psi_io_full", "cg_io_read", "cg_io_write"],
+      "needs": "node_exporter 或 cgroup-exporter 的 IO 統計"
+    },
+    {
+      "id": "dstate-stall",
+      "group": "主機資源",
+      "title": "process 卡在不可中斷睡眠(D state)",
+      "signature": "D state 的 process 數增加;嚴重時 kernel log 出現 blocked for more than 120 seconds",
+      "signals": ["cg_dstate", "ffds_dstate"],
+      "events": ["t_dstate"],
+      "log": ["blocked for more than", "hung_task"],
+      "needs": "cgroup-exporter"
+    },
+    {
+      "id": "disk-full",
+      "group": "主機資源",
+      "title": "檔案系統快滿或已滿",
+      "signature": "某個掛載點使用率超過 95%",
+      "signals": ["host_fs_used"],
+      "needs": "node_exporter"
+    },
+    {
+      "id": "network-saturation",
+      "group": "主機資源",
+      "title": "網路頻寬被吃滿",
+      "signature": "網卡收送速率明顯高於平常",
+      "signals": ["host_net_rx", "host_net_tx"],
+      "needs": "node_exporter"
+    },
+    {
+      "id": "cpu-throttling",
+      "group": "cgroup 與容器",
+      "title": "被 CPU 配額限流",
+      "signature": "cgroup 的 throttled 時間增加,或 container 的 CFS period 被大量限流",
+      "signals": ["cg_cpu_throttled", "ctr_throttled"],
+      "needs": "cgroup-exporter 或 cAdvisor"
+    },
+    {
+      "id": "memory-limit",
+      "group": "cgroup 與容器",
+      "title": "打到 memory.high,被刻意拖慢",
+      "signature": "memory.high 的觸發次數增加(kernel 用延遲來逼 cgroup 降低用量)",
+      "signals": ["cg_mem_high"],
+      "needs": "cgroup-exporter"
+    },
+    {
+      "id": "single-hog",
+      "group": "cgroup 與容器",
+      "title": "單一使用者或 process 吃掉大部分資源",
+      "signature": "某個 cgroup 的 CPU、記憶體或 IO 佔用遠高於其他人",
+      "kind": "usage",
+      "tables": ["t_cpu_service", "t_anon_service", "t_top_cpu_proc", "t_top_mem_proc", "t_top_io_proc"],
+      "needs": "cgroup-exporter"
+    },
+    {
+      "id": "container-neighbor",
+      "group": "cgroup 與容器",
+      "title": "某個 container 排擠到其他人",
+      "signature": "單一 container 的 CPU 或記憶體用量遠高於其他 container",
+      "kind": "usage",
+      "signals": ["ctr_cpu", "ctr_mem"],
+      "tables": ["t_ctr_cpu"],
+      "needs": "cAdvisor"
+    },
+    {
+      "id": "remote-fs",
+      "group": "儲存與網路",
+      "title": "遠端檔案系統(NFS / SMB)沒有回應",
+      "signature": "kernel log 出現 nfs / cifs 的錯誤或 server not responding",
+      "log": ["server not responding", "nfs:", "cifs", "smb2", "reconnecting to"],
+      "needs": "host-logs.txt(kernel log)"
+    },
+    {
+      "id": "sync-interference",
+      "group": "儲存與網路",
+      "title": "檔案同步 job 搶走 IO",
+      "signature": "同步 job 正在跑,讀寫速率高,或同步 process 卡在 D state",
+      "signals": ["ffds_jobs", "ffds_read", "ffds_write", "ffds_dstate"],
+      "needs": "同步 job 的 exporter(只有同步主機才有)"
+    },
+    {
+      "id": "gpu-fault",
+      "group": "GPU",
+      "title": "GPU 硬體或驅動出錯",
+      "signature": "XID 錯誤或 PCIe replay 增加;kernel log 出現 NVRM Xid",
+      "signals": ["gpu_xid", "gpu_pcie_replay"],
+      "events": ["t_gpu_xid"],
+      "log": ["nvrm", "xid"],
+      "needs": "DCGM exporter"
+    },
+    {
+      "id": "gpu-contention",
+      "group": "GPU",
+      "title": "GPU 記憶體或算力被佔滿",
+      "signature": "GPU 使用率或顯存長時間接近上限,少數使用者佔掉大部分",
+      "kind": "usage",
+      "signals": ["gpu_util", "gpu_mem", "gpu_user_mem"],
+      "tables": ["t_gpu_user_mem"],
+      "needs": "NVML exporter"
+    },
+    {
+      "id": "user-surge",
+      "group": "其他",
+      "title": "同時使用的人數突然變多",
+      "signature": "登入帳號數明顯高於平常",
+      "signals": ["cg_logged_in"],
+      "needs": "cgroup-exporter"
+    },
+    {
+      "id": "kernel-hardware",
+      "group": "其他",
+      "title": "kernel 或硬體層級的錯誤",
+      "signature": "kernel log 出現 I/O error、soft lockup、MCE、溫度或供電警告",
+      "log": ["i/o error", "blk_update_request", "soft lockup", "machine check", "mce:",
+              "thermal", "under-voltage", "critical temperature"],
+      "needs": "host-logs.txt(kernel log)"
+    },
+    {
+      "id": "monitoring-gap",
+      "group": "其他",
+      "title": "監控本身在那段時間有缺漏",
+      "signature": "某些 job 的 up 為 0,或完全沒有樣本;這種時段不能說『當時沒異常』",
+      "kind": "coverage",
+      "needs": "Prometheus 的 up"
+    }
+  ]
+}

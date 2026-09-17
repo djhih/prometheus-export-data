@@ -47,6 +47,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE = HERE / "postmortem-template.zh-tw.md"
+DEFAULT_HYPOTHESES = HERE / "hypotheses.zh-tw.json"
 
 MAX_POINTS = 11000          # Prometheus rejects query_range above this per series
 STEPS = (15, 30, 60, 120, 300, 600, 1800, 3600)
@@ -216,7 +217,7 @@ def build_catalog(inst: str, step: int, dur_s: float) -> list[Query]:
         Query("cg_dstate", "cgroup", "Processes in D state",
               f"sum by (service, comm) ({peak(s('cgroup_process_dstate_count'))})", "count", floor=0.5),
         Query("cg_logged_in", "cgroup", "Logged-in users",
-              peak(s("cgroup_logged_in_users")), "count"),
+              peak(s("cgroup_logged_in_users")), "count", floor=1),
 
         Query("ctr_cpu", "containers", "CPU used per container",
               f"sum by (name) (rate({ctr('container_cpu_usage_seconds_total')}[{rw()}]))", "cores", floor=4),
@@ -582,6 +583,42 @@ def human_dur(sec: float) -> str:
     return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
 
 
+# ------------------------------------------------------------ host logs ----
+
+# journalctl -o short-iso: 2026-09-14T14:32:05+0800 host kernel: ...
+LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-]\d{2}):?(\d{2})")
+
+
+class LogScan:
+    """host-logs.txt from collect-host-logs.sh: the evidence Prometheus has no
+    metric for (OOM kills, hung tasks, XID, remote filesystem errors)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lines = [ln for ln in path.read_text(errors="replace").splitlines()
+                      if not ln.startswith("=====")]   # our own section headers name the patterns
+
+    def hits(self, patterns: list) -> list:
+        """[(pattern, count, first matching line)] - patterns are plain substrings."""
+        out = []
+        for pat in patterns:
+            rx = re.compile(re.escape(pat), re.I)
+            matched = [ln for ln in self.lines if rx.search(ln)]
+            if matched:
+                out.append((pat, len(matched), matched[0].strip()))
+        return out
+
+    @staticmethod
+    def stamp(line: str) -> float | None:
+        m = LOG_TS.match(line)
+        if not m:
+            return None
+        try:
+            return datetime.fromisoformat(f"{m[1]}{m[2]}:{m[3]}").timestamp()
+        except ValueError:
+            return None
+
+
 # ------------------------------------------------------------- rendering ---
 
 class Report:
@@ -596,11 +633,14 @@ class Report:
             if res.query.kind == "range" and qid not in ("up", "alerts"):
                 self.stats[qid] = [analyze(sr, res.query, w) for sr in res.series]
         self.events = []                                # (t, text)
+        self.coverage_issues = []                       # filled by coverage(), read by the hypotheses
+        self.log_seen = set()                           # one timeline entry per log line, not per pattern
 
     # -- coverage ------------------------------------------------------------
     def coverage(self) -> str:
         w, res = self.w, self.r["up"]
         if res.error:
+            self.coverage_issues.append(f"`up` query failed: {res.error}")
             return f"- `up` query failed: {res.error}"
         if not res.series:
             return (f"- **No `up` series for instance `{self.inst}` in the window.** Either the host is wrong "
@@ -616,8 +656,10 @@ class Report:
             down_runs, gap_runs = runs(down, w.step), runs(missing, w.step)
             for a, b in down_runs:
                 self.events.append((a, f"Scrape target down: job `{job}` until {w.hms(b)}"))
+                self.coverage_issues.append(f"`{job}` down {span(a, b, w)}")
             for a, b in gap_runs:
                 self.events.append((a, f"No samples from job `{job}` until {w.hms(b)}"))
+                self.coverage_issues.append(f"`{job}` no samples {span(a, b, w)}")
             lines.append(f"| {job} | {sr.labels.get('instance', '')} | {100 * len(present) / expected:.1f} % | "
                          f"{'; '.join(span(a, b, w) for a, b in down_runs) or 'none'} | "
                          f"{'; '.join(span(a, b, w) for a, b in gap_runs) or 'none'} |")
@@ -812,6 +854,119 @@ class Report:
             lines.append(f"- ... {dropped} more candidate events omitted.")
         return "\n".join(lines)
 
+    # -- hypotheses ----------------------------------------------------------
+    def _series_txt(self, qid: str, st: Stat) -> str:
+        keys = label_keys([s.series.labels for s in self.stats.get(qid, [])])
+        return f" [{fmt_labels(st.series.labels, keys)}]" if keys else ""
+
+    def _rows_txt(self, qids: list, limit: int = 3) -> str:
+        out = []
+        for qid in qids:
+            res = self.r.get(qid)
+            if not res or res.error or not res.series:
+                continue
+            keys = ordered({k for lb, _ in res.series for k in lb} - TABLE_HIDDEN)
+            for lb, v in res.series[:limit]:
+                out.append(f"{cell(fmt_labels(lb, keys), 45)} {fmt(v, res.query.unit)}")
+            break                                        # one table is enough for a summary cell
+        return "; ".join(out)
+
+    def judge(self, h: dict, lab: dict, ph: dict, log) -> tuple:
+        """(verdict, evidence) for one hypothesis, from the data actually returned."""
+        if h.get("kind") == "coverage":
+            return ((lab["supported"], cell("; ".join(self.coverage_issues), 300))
+                    if self.coverage_issues else (lab["ruled_out"], ph["coverage_ok"]))
+
+        have, missing = [], []
+        for qid in h.get("signals", []):
+            res = self.r.get(qid)
+            (missing if (res is None or res.error or not res.series) else have).append(qid)
+        moved = sorted(((qid, st) for qid in have for st in self.stats.get(qid, []) if st.moved),
+                       key=lambda x: x[1].ratio, reverse=True)
+        events = []
+        for qid in h.get("events", []):
+            res = self.r.get(qid)
+            if res and not res.error:
+                events += [(qid, lb, v) for lb, v in res.series if v >= 0.5]
+        hits = log.hits(h["log"]) if (log and h.get("log")) else []
+        for pat, _, line in hits:                        # kernel evidence belongs on the timeline
+            at = LogScan.stamp(line)
+            if at and self.w.ctx_start - 3600 <= at <= self.w.ctx_end + 3600 and line not in self.log_seen:
+                self.log_seen.add(line)                  # several patterns can hit the same line
+                self.events.append((at, f"host log ({pat}): {cell(line, 120)}"))
+
+        bits = []
+        for qid, st in moved[:2]:
+            q = self.r[qid].query
+            bits.append(ph["peak"].format(signal=qid, series=self._series_txt(qid, st),
+                                          peak=fmt(st.peak if st.peak is not None else st.inc_max, q.unit),
+                                          base=fmt(st.base_p95, q.unit), threshold=fmt(st.threshold, q.unit),
+                                          time=self.w.hms(st.first)))
+        for qid, lb, v in events[:2]:
+            res = self.r[qid]
+            keys = ordered(set(lb) - TABLE_HIDDEN)
+            bits.append(ph["event"].format(signal=qid, series=f" [{fmt_labels(lb, keys)}]" if keys else "",
+                                           value=fmt(v, res.query.unit)))
+        for pat, n, _ in hits[:3]:
+            bits.append(ph["log"].format(pattern=pat, count=n))
+
+        if h.get("kind") == "usage":                     # high usage is not by itself a cause
+            rows = self._rows_txt(h.get("tables", []))
+            if not rows and not bits:
+                return lab["undetermined"], self._nodata(ph, h, missing or h.get("tables", []))
+            return lab["manual"], "; ".join(bits + ([ph["top"].format(rows=rows)] if rows else []))
+        if bits:
+            return lab["supported"], "; ".join(bits)
+        if not have and not (h.get("log") and log):
+            gap = missing or h.get("signals", [])
+            return lab["undetermined"], (ph["nologs"] if (h.get("log") and not log)
+                                         else self._nodata(ph, h, gap))
+
+        scored = [(qid, st) for qid in have for st in self.stats.get(qid, [])
+                  if st.inc_max is not None and st.threshold]
+        if not scored:
+            # data exists but carries no threshold (informational signals): a human must look
+            peaks = sorted(((qid, st) for qid in have for st in self.stats.get(qid, [])
+                            if st.inc_max is not None), key=lambda x: x[1].inc_max, reverse=True)
+            for qid, st in peaks[:2]:
+                bits.append(ph["no_threshold"].format(signal=qid, series=self._series_txt(qid, st),
+                                                      peak=fmt(st.inc_max, self.r[qid].query.unit)))
+            return (lab["manual"], "; ".join(bits)) if bits else \
+                   (lab["undetermined"], self._nodata(ph, h, missing or h.get("signals", [])))
+
+        # data was there and nothing crossed its threshold: say how close it got
+        best = max(scored, key=lambda x: x[1].ratio, default=None)
+        if best:
+            qid, st = best
+            q = self.r[qid].query
+            bits.append(ph["below"].format(signal=qid, series=self._series_txt(qid, st),
+                                           max=fmt(st.inc_max, q.unit), threshold=fmt(st.threshold, q.unit)))
+        if h.get("log") and log and not hits:
+            bits.append(ph["log_none"].format(patterns=", ".join(h["log"][:4])))
+        if missing:
+            bits.append(ph["missing"].format(signals=", ".join(f"`{m}`" for m in missing)))
+        return lab["ruled_out"], "; ".join(bits) or ph["none"]
+
+    @staticmethod
+    def _nodata(ph: dict, h: dict, gap: list) -> str:
+        txt = ph["nodata"].format(signals=", ".join(f"`{g}`" for g in gap[:6]))
+        return f"{txt}({h['needs']})" if h.get("needs") else txt
+
+    def hypotheses(self, spec: dict, log) -> str:
+        lab, ph = spec["labels"], spec["phrases"]
+        lines = ["| 分類 | 假設 | 若成立應該看到 | 實際資料 | 結論 |", "|---|---|---|---|---|"]
+        tally = {}
+        for h in spec["hypotheses"]:
+            verdict, evidence = self.judge(h, lab, ph, log)
+            tally[verdict] = tally.get(verdict, 0) + 1
+            lines.append(f"| {h.get('group', '')} | {h['title']} | {cell(h['signature'], 120)} | "
+                         f"{cell(evidence, 300)} | **{verdict}** |")
+        counts = "、".join(f"{v} {n}" for v, n in ((lab[k], tally.get(lab[k], 0))
+                                                   for k in ("ruled_out", "supported", "manual", "undetermined"))
+                          if n)
+        lines += ["", ph.get("tally", "{total}: {counts}").format(total=len(spec["hypotheses"]), counts=counts)]
+        return "\n".join(lines)
+
     # -- links / files -------------------------------------------------------
     def links(self) -> str:
         base = self.args.grafana.rstrip("/")
@@ -921,6 +1076,10 @@ def main() -> int:
     ap.add_argument("--title", default=None, help="incident title for the draft")
     ap.add_argument("--out", type=Path, default=None, help="output directory (default: ./incident-<instance>-<start>)")
     ap.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE)
+    ap.add_argument("--hypotheses", type=Path, default=DEFAULT_HYPOTHESES,
+                    help="root-cause checklist to judge against the data")
+    ap.add_argument("--host-logs", type=Path, default=None,
+                    help="host-logs.txt from collect-host-logs.sh; adds kernel evidence to the checklist")
     ap.add_argument("--force", action="store_true", help="write into an existing non-empty output directory")
     ap.add_argument("--list", action="store_true", help="print the query catalog and exit")
     args = ap.parse_args()
@@ -984,6 +1143,15 @@ def main() -> int:
         status = f"error: {res.error[:80]}" if res.error else f"{len(res.series)} series"
         print(f"  [{i:2d}/{len(catalog)}] {q.id:<22} {status}", file=sys.stderr)
 
+    log = None
+    if args.host_logs:
+        if args.host_logs.exists():
+            log = LogScan(args.host_logs)
+            print(f"host logs: {len(log.lines)} lines from {args.host_logs}", file=sys.stderr)
+        else:
+            print(f"warning: --host-logs {args.host_logs} not found; kernel checks skipped", file=sys.stderr)
+    spec = json.loads(args.hypotheses.read_text())
+
     meta = {
         "generated": datetime.now(tz).isoformat(timespec="seconds"),
         "args": {k: (str(v) if isinstance(v, (Path, timezone)) else v) for k, v in vars(args).items()},
@@ -992,6 +1160,7 @@ def main() -> int:
                    "step_seconds": step},
         "prometheus": {"url": prom, "build": info.get("data", {}), "retention": retention},
         "alert_rules": alert_rules,
+        "host_logs": str(args.host_logs) if log else None,
         "queries": [{"id": q.id, "section": q.section, "title": q.title, "kind": q.kind, "expr": q.expr,
                      "unit": q.unit, "floor": q.floor, "series": len(results[q.id].series),
                      "error": results[q.id].error or None} for q in catalog],
@@ -1008,6 +1177,7 @@ def main() -> int:
         "TZ": tz_label(tz),
         "EXPIRY": expiry,
         "GENERATED": f"incident_dump.py, {meta['generated']}, Prometheus {prom}",
+        "AUTO_HYPOTHESES": rep.hypotheses(spec, log),
         "AUTO_IMPACT": rep.impact(),
         "AUTO_DETECTION": rep.detection(),
         "AUTO_TIMELINE": rep.timeline(),
