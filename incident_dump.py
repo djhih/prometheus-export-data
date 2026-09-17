@@ -96,7 +96,11 @@ class Query:
 
 
 def build_catalog(inst: str, step: int, dur_s: float) -> list[Query]:
-    im = f'instance="{inst}"'
+    # Jobs don't agree on the instance label: most keep Prometheus' default
+    # host:port (a different port per exporter), some relabel to the bare
+    # host. Match both - anchored, so node-1 never matches node-11.
+    host_re = re.escape(inst).replace("\\", "\\\\")   # backslashes doubled inside a PromQL string
+    im = f'instance=~"{host_re}(:[0-9]+)?"'
 
     def s(metric, *extra):
         return metric + "{" + ",".join((im,) + extra) + "}"
@@ -599,10 +603,11 @@ class Report:
         if res.error:
             return f"- `up` query failed: {res.error}"
         if not res.series:
-            return (f"- **No `up` series for instance `{self.inst}` in the window.** Either the instance "
-                    "string is wrong (it must byte-match the scrape config) or the data has aged out.")
+            return (f"- **No `up` series for instance `{self.inst}` in the window.** Either the host is wrong "
+                    "(compare with `count by (job, instance) (up)`) or the data has aged out.")
         expected = int((w.ctx_end - w.ctx_start) // w.step) + 1
-        lines = ["| job | samples present | target down | no samples (scrape gap) |", "|---|---|---|---|"]
+        lines = ["| job | instance | samples present | target down | no samples (scrape gap) |",
+                 "|---|---|---|---|---|"]
         for sr in sorted(res.series, key=lambda s: s.labels.get("job", "")):
             job = sr.labels.get("job", "?")
             present = {round((t - w.ctx_start) / w.step) for t, _ in sr.points}
@@ -613,7 +618,7 @@ class Report:
                 self.events.append((a, f"Scrape target down: job `{job}` until {w.hms(b)}"))
             for a, b in gap_runs:
                 self.events.append((a, f"No samples from job `{job}` until {w.hms(b)}"))
-            lines.append(f"| {job} | {100 * len(present) / expected:.1f} % | "
+            lines.append(f"| {job} | {sr.labels.get('instance', '')} | {100 * len(present) / expected:.1f} % | "
                          f"{'; '.join(span(a, b, w) for a, b in down_runs) or 'none'} | "
                          f"{'; '.join(span(a, b, w) for a, b in gap_runs) or 'none'} |")
         lines.append("")
@@ -906,7 +911,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Dump Prometheus evidence for an incident window and draft a postmortem.")
     ap.add_argument("--start", required=True, help="reported start, e.g. '2026-09-10 14:00' (or RFC3339 / unix)")
     ap.add_argument("--end", required=True, help="reported end")
-    ap.add_argument("--instance", required=True, help="instance label of the affected host, e.g. gpu-node-1")
+    ap.add_argument("--instance", required=True, help="affected host as in its instance label, port optional (matches host and host:<port>)")
     ap.add_argument("--pad", type=parse_duration, default=parse_duration("1h"),
                     help="context before/after the window; the part before is the baseline (default 1h)")
     ap.add_argument("--tz", type=parse_offset, default=None, help="offset for naive times, e.g. +08:00")
@@ -920,6 +925,7 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="print the query catalog and exit")
     args = ap.parse_args()
 
+    args.instance = re.sub(r":[0-9]+$", "", args.instance)   # host:port -> host; queries match any port
     tz = args.tz or datetime.now().astimezone().tzinfo    # the report is written in one zone
     start = parse_time(args.start, args.tz).astimezone(tz)
     end = parse_time(args.end, args.tz).astimezone(tz)

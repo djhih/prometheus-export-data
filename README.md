@@ -40,8 +40,10 @@ ssh gpu-node-1 'bash -s' < collect-host-logs.sh > host-logs.txt
 # 4. 編輯 postmortem.zh-tw.md
 ```
 
-`--instance` 必須和 `prometheus.yml` 裡的 `instance` label **一字不差**;
-打錯的話,報告的「資料完整性」那一段會直接寫「沒有 `up` series」。
+`--instance` 填主機名或 IP 就好,port 可省略。各 exporter 的 `instance` label 常常不一致:
+多數是 Prometheus 預設的 `主機:port`(每個 exporter 的 port 不同),也有被 relabel 成只剩主機的,
+腳本兩種都會比對。報告的「資料完整性」表會列出每個 job 實際的 `instance`;
+主機打錯的話,那一段會直接寫「沒有 `up` series」。
 
 如果 Prometheus 資料是複製出來的 TSDB(掛成本機 Prometheus,例如 9091),
 加上 `--prom http://localhost:9091`。
@@ -51,7 +53,7 @@ ssh gpu-node-1 'bash -s' < collect-host-logs.sh > host-logs.txt
 | 參數 | 預設 | 說明 |
 | --- | --- | --- |
 | `--start` / `--end` | 必填 | 回報的時間窗。接受 `2026-09-10 14:00`、RFC3339、unix 秒 |
-| `--instance` | 必填 | 受影響主機的 `instance` label |
+| `--instance` | 必填 | 受影響主機名或 IP;port 可省略,`主機` 和 `主機:port` 兩種 instance 都會比對 |
 | `--pad` | `1h` | 時間窗前後多撈的範圍;**前面那段就是基準線** |
 | `--tz` | 本機時區 | 報告使用的時區,例如 `+08:00` |
 | `--prom` | `http://localhost:9090` | Prometheus 位址 |
