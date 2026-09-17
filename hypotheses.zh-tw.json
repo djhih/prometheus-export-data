@@ -21,6 +21,7 @@
     "log": "host-logs 命中「{pattern}」{count} 筆",
     "nodata": "無資料:{signals}",
     "nologs": "未提供 host-logs.txt,kernel log 未檢查",
+    "log_gap": "host-logs 顯示 journal 沒有涵蓋這段時間,kernel 證據無法判斷",
     "missing": "(另外無資料:{signals})",
     "top": "用量最高:{rows}",
     "log_none": "host-logs 未命中:{patterns}",
@@ -149,7 +150,8 @@
       "group": "儲存與網路",
       "title": "遠端檔案系統(NFS / SMB)沒有回應",
       "signature": "kernel log 出現 nfs / cifs 的錯誤或 server not responding",
-      "log": ["server not responding", "nfs:", "cifs", "smb2", "reconnecting to"],
+      "log": ["server not responding", "nfs: server", "cifs: vfs", "reconnecting to",
+              "stale file handle", "nfs4_reclaim"],
       "needs": "host-logs.txt(kernel log)"
     },
     {

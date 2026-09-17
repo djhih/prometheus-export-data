@@ -215,7 +215,7 @@ def build_catalog(inst: str, step: int, dur_s: float) -> list[Query]:
         Query("cg_io_write", "cgroup", "Disk write per cgroup",
               f"sum by (service) (rate({s('cgroup_io_written_bytes_total')}[{rw()}]))", "Bps", floor=50e6),
         Query("cg_dstate", "cgroup", "Processes in D state",
-              f"sum by (service, comm) ({peak(s('cgroup_process_dstate_count'))})", "count", floor=0.5),
+              f"sum by (service, comm) ({peak(s('cgroup_process_dstate_count'))})", "count", floor=3),
         Query("cg_logged_in", "cgroup", "Logged-in users",
               peak(s("cgroup_logged_in_users")), "count", floor=1),
 
@@ -593,10 +593,26 @@ class LogScan:
     """host-logs.txt from collect-host-logs.sh: the evidence Prometheus has no
     metric for (OOM kills, hung tasks, XID, remote filesystem errors)."""
 
+    SCANNED = re.compile(r"journal|kernel|dmesg|log", re.I)
+    COVERAGE = re.compile(r"entries in window:\s*(\d+)")
+
     def __init__(self, path: Path):
         self.path = path
-        self.lines = [ln for ln in path.read_text(errors="replace").splitlines()
-                      if not ln.startswith("=====")]   # our own section headers name the patterns
+        self.covered = True      # False once we know the journal has nothing for the window
+        self.lines, keep, saw_header = [], True, False
+        for ln in path.read_text(errors="replace").splitlines():
+            if ln.startswith("====="):
+                # section headers name the very patterns we grep for, and inventory
+                # sections (mount tables, sar) are not events - skip both
+                saw_header, keep = True, bool(self.SCANNED.search(ln))
+                continue
+            m = self.COVERAGE.search(ln)
+            if m:
+                self.covered = int(m[1]) > 0
+            if keep:
+                self.lines.append(ln)
+        if not saw_header:       # not our format: scan everything
+            self.lines = path.read_text(errors="replace").splitlines()
 
     def hits(self, patterns: list) -> list:
         """[(pattern, count, first matching line)] - patterns are plain substrings."""
@@ -888,7 +904,8 @@ class Report:
             res = self.r.get(qid)
             if res and not res.error:
                 events += [(qid, lb, v) for lb, v in res.series if v >= 0.5]
-        hits = log.hits(h["log"]) if (log and h.get("log")) else []
+        usable = log if (log and log.covered) else None
+        hits = usable.hits(h["log"]) if (usable and h.get("log")) else []
         for pat, _, line in hits:                        # kernel evidence belongs on the timeline
             at = LogScan.stamp(line)
             if at and self.w.ctx_start - 3600 <= at <= self.w.ctx_end + 3600 and line not in self.log_seen:
@@ -917,8 +934,10 @@ class Report:
             return lab["manual"], "; ".join(bits + ([ph["top"].format(rows=rows)] if rows else []))
         if bits:
             return lab["supported"], "; ".join(bits)
-        if not have and not (h.get("log") and log):
+        if not have and not (h.get("log") and usable):
             gap = missing or h.get("signals", [])
+            if h.get("log") and log and not log.covered:
+                return lab["undetermined"], ph.get("log_gap", ph["nologs"])
             return lab["undetermined"], (ph["nologs"] if (h.get("log") and not log)
                                          else self._nodata(ph, h, gap))
 
@@ -941,7 +960,7 @@ class Report:
             q = self.r[qid].query
             bits.append(ph["below"].format(signal=qid, series=self._series_txt(qid, st),
                                            max=fmt(st.inc_max, q.unit), threshold=fmt(st.threshold, q.unit)))
-        if h.get("log") and log and not hits:
+        if h.get("log") and usable and not hits:
             bits.append(ph["log_none"].format(patterns=", ".join(h["log"][:4])))
         if missing:
             bits.append(ph["missing"].format(signals=", ".join(f"`{m}`" for m in missing)))
@@ -1022,6 +1041,11 @@ section() {{ printf '\\n===== %s =====\\n' "$*"; }}
 
 section "host"
 hostname; uname -r; uptime; id
+
+section "journal coverage: does the journal even reach this window?"
+echo "entries in window: $(journalctl --since "$SINCE" --until "$UNTIL" --no-pager -q 2>/dev/null | wc -l)"
+echo -n "oldest journal entry: "; journalctl --no-pager -o short-iso -q 2>/dev/null | head -n 1
+journalctl --disk-usage 2>&1
 
 section "journal: priority warning and above"
 journalctl --since "$SINCE" --until "$UNTIL" -p warning --no-pager -o short-iso 2>&1 | tail -n 2000
