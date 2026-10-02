@@ -23,6 +23,9 @@
 
 只有 Python 標準函式庫,不需要 pip。
 
+完整的處理流程(含跳板機、主機 log、寫報告的順序與常見陷阱)寫在
+[`RUNBOOK.zh-tw.md`](RUNBOOK.zh-tw.md)。
+
 ## 快速開始
 
 ```bash
@@ -96,6 +99,15 @@ Prometheus 只保留 15 天,**這個資料夾就是證據的正本**。
 
 某個 exporter 在這台主機上不存在(例如沒有 GPU),總覽表會寫 `no data`,不影響其他部分。
 query 執行失敗會記在 `meta.json` 和總覽表的最後一欄,其他 query 會繼續跑。
+
+## 其他檔案
+
+| 檔案 | 用途 |
+| --- | --- |
+| `RUNBOOK.zh-tw.md` | 收到回報後的完整流程 |
+| `collect-via-jump.sh` | 監控主機連不到目標主機時,從跳板機中繼撈 log |
+| `stall_check.py` | 從撈好的 CSV 判斷卡住的 process 在等什麼(本機磁碟 vs 外部) |
+| `hypotheses.zh-tw.json` | 排查清單的定義 |
 
 ## 排查清單(原因假設)
 
